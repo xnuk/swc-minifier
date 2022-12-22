@@ -14,7 +14,7 @@ jobs:
           ~/.cargo/git/db/
           target/
           ~/.rustup
-        key: ${{ runner.os }}-cargo-${{ hashFile('**/Cargo.lock') }}-${{ hashFile('**/Cargo.toml') }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
     - name: rust latest stable
       run: rustup install stable && rustup default stable
     - name: upx
