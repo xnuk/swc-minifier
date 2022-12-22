@@ -1,0 +1,37 @@
+name: Build
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/
+          ~/.cargo/git/db/
+          target/
+          ~/.rustup
+        key: ${{ runner.os }}-cargo-${{ hashFile('**/Cargo.lock') }}-${{ hashFile('**/Cargo.toml') }}
+    - name: rust latest stable
+      run: rustup install stable && rustup default stable
+    - name: upx
+      run: >
+        curl -L --get https://github.com/upx/upx/releases/download/v4.0.1/upx-4.0.1-amd64_linux.tar.xz
+        | tar -xJOf - upx-4.0.1-amd64_linux/upx > upx
+        && chmod +x upx
+        && sha256sum upx
+        | grep 4943e5e4c5b9c00e78e88e3fecb50ed52a6dccf85714fe2c3bced7ebfb0dd285
+    - run: cargo build --release
+    - name: compressing
+      run: >
+        cp target/release/swc-minifier .
+        && strip -s swc-minifier
+        && ./upx swc-minifier
+        && chmod +x swc-minifier
+    - uses: actions/upload-artifact@v3
+      with:
+        name: swc-minifier
+        path: swc-minifier
