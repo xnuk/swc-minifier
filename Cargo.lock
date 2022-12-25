@@ -347,10 +347,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "libc"
-version = "0.2.138"
+name = "lexopt"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db6d7e329c562c5dfab7a46a2afabc8b987ab9a4834c9d1ca04dc54c1546cef8"
+checksum = "478ee9e62aaeaf5b140bd4138753d1f109765488581444218d3ddda43234f3e8"
+
+[[package]]
+name = "libc"
+version = "0.2.139"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201de327520df007757c1f0adce6e827fe8562fbc28bfd9c15571c66ca1f5f79"
 
 [[package]]
 name = "lock_api"
@@ -791,9 +797,10 @@ checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
 
 [[package]]
 name = "swc-minifier"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "lexopt",
  "serde",
  "serde_derive",
  "serde_json",

@@ -1,26 +1,16 @@
-use anyhow::anyhow;
-use swc_common::{sync::Lrc, FileName, SourceMap};
-use swc_ecma_ast::{EsVersion, Expr, Program};
-use swc_ecma_codegen::{
-	text_writer::JsWriter, Config as CodegenConfig, Emitter as CodegenEmitter,
-};
-use swc_ecma_minifier::{
-	optimize as minifier_optimize,
-	option::{
-		CompressOptions, ExtraOptions, MangleOptions, ManglePropertiesOptions,
-		MinifyOptions, PureGetterOption, TopLevelOptions,
-	},
-};
-use swc_ecma_parser::{parse_file_as_module, EsConfig, Syntax};
-use swc_ecma_visit::VisitMutWith;
+use swc_common::{sync::Lrc, FileName, SourceMap, SourceMapper, Span};
+use swc_ecma_ast::{EsVersion, Expr};
+use swc_ecma_minifier::option::{ExtraOptions, MinifyOptions};
+use swc_ecma_parser as ecma;
 
 use serde::{de::Deserialize, Deserializer};
 use serde_derive::Deserialize;
-use serde_json::{from_value, json};
 
-use std::{collections::HashMap, io};
+use std::{
+	collections::HashMap, error, ffi::OsString, fmt, fs, io, path::Path,
+};
 
-const SANE_ECMA: Syntax = Syntax::Es(EsConfig {
+const SANE_ECMA: ecma::Syntax = ecma::Syntax::Es(ecma::EsConfig {
 	jsx: false,
 	fn_bind: false,
 	decorators: false,
@@ -31,18 +21,58 @@ const SANE_ECMA: Syntax = Syntax::Es(EsConfig {
 	allow_return_outside_function: false,
 });
 
+trait SpanToString {
+	fn span_to_string(&self, span: Span) -> String;
+}
+
+impl<T: SourceMapper> SpanToString for T {
+	fn span_to_string(&self, span: Span) -> String {
+		SourceMapper::span_to_string(self, span)
+	}
+}
+
+struct StringSource<'a>(FileName, &'a str);
+
+impl<'a> SpanToString for StringSource<'a> {
+	fn span_to_string(&self, span: Span) -> String {
+		let sourcemap = SourceMap::default();
+		sourcemap.new_source_file(self.0.clone(), self.1.to_string());
+		SourceMap::span_to_string(&sourcemap, span)
+	}
+}
+
+fn error_to_string(
+	sourcemap: &impl SpanToString,
+	err: &swc_ecma_parser::error::Error,
+) -> String {
+	use swc_common::Spanned;
+
+	let mut res = sourcemap.span_to_string(err.span());
+	res.push_str(": ");
+	res.push_str(&err.kind().msg());
+
+	res
+}
+
 fn parse_expr(s: impl AsRef<str>) -> Result<Box<Expr>, String> {
 	use swc_common::source_map::BytePos;
 	use swc_ecma_parser::{lexer::Lexer, Parser, StringInput};
 
+	let source = s.as_ref();
+
 	Parser::new_from(Lexer::new(
 		SANE_ECMA,
 		EsVersion::latest(),
-		StringInput::new(s.as_ref(), BytePos::DUMMY, BytePos::DUMMY),
+		StringInput::new(source, BytePos::DUMMY, BytePos::DUMMY),
 		None,
 	))
 	.parse_expr()
-	.map_err(|e| format!("{e:?}"))
+	.map_err(|e| {
+		error_to_string(
+			&StringSource(FileName::Internal("expr".into()), source),
+			&e,
+		)
+	})
 }
 
 #[repr(transparent)]
@@ -89,8 +119,13 @@ struct MiniOpt {
 	target: TargetVersion,
 }
 
-fn minify_option(opt: &MiniOpt) -> Result<MinifyOptions, String> {
-	Ok(MinifyOptions {
+fn minify_option(opt: &MiniOpt) -> MinifyOptions {
+	use swc_ecma_minifier::option::{
+		CompressOptions, MangleOptions, ManglePropertiesOptions,
+		PureGetterOption, TopLevelOptions,
+	};
+
+	MinifyOptions {
 		rename: true,
 		compress: Some(CompressOptions {
 			arguments: false,
@@ -170,15 +205,6 @@ fn minify_option(opt: &MiniOpt) -> Result<MinifyOptions, String> {
 
 		wrap: false,
 		enclose: false,
-	})
-}
-
-const fn codegen_config(target: TargetVersion) -> CodegenConfig {
-	CodegenConfig {
-		target: target.0,
-		ascii_only: false,
-		minify: true,
-		omit_last_semi: true,
 	}
 }
 
@@ -192,77 +218,221 @@ fn with_extra_options<T>(func: impl FnOnce(ExtraOptions) -> T) -> T {
 	})
 }
 
-fn minify(
-	input: &mut impl io::Read,
-	opt: MiniOpt,
-	output: impl io::Write,
-) -> anyhow::Result<()> {
-	use swc_ecma_transforms_base::{fixer::fixer, resolver};
+#[repr(transparent)]
+struct Output(Vec<u8>);
 
-	let mut source = String::new();
-	input.read_to_string(&mut source)?;
-	let sourcemap: Lrc<SourceMap> = Default::default();
+struct Messages {
+	warns: Vec<String>,
+	result: Result<Output, String>,
+}
 
-	let file = sourcemap.new_source_file(FileName::Anon, source);
-	let mut errors = Vec::new();
-	let res = parse_file_as_module(
-		&file,
-		SANE_ECMA,
-		EsVersion::latest(),
-		None,
-		&mut errors,
-	);
+fn minify(source: String, opt: MiniOpt) -> Messages {
+	// use swc_common::comments::{Comments, SingleThreadedComments};
+	use swc_ecma_ast::Program;
+	use swc_ecma_codegen::{
+		self as codegen,
+		text_writer::{
+			// why the fuck
+			omit_trailing_semi,
+			JsWriter,
+		},
+	};
+	use swc_ecma_parser::{Parser, StringInput};
 
-	for error in &errors {
-		eprintln!("{error:?}");
-	}
+	let sourcemap = Lrc::<SourceMap>::default();
 
-	let mut module = res.map_err(|e| anyhow!("{e:?}"))?;
+	// TODO: leading userscript comments, pure comments
+	// let comments = SingleThreadedComments::default();
+	// let dyn_comments = Some(&comments as &dyn Comments);
 
-	with_extra_options(move |extra_option| {
+	let dyn_comments = None;
+
+	let file =
+		sourcemap.new_source_file(FileName::Real("source".into()), source);
+
+	let mut parser =
+		Parser::new(SANE_ECMA, StringInput::from(&*file), dyn_comments);
+	let module = parser.parse_module();
+
+	let warns: Vec<String> = {
+		let sourcemap = sourcemap.as_ref();
+		parser
+			.take_errors()
+			.drain(0..)
+			.map(|err| error_to_string(sourcemap, &err))
+			.collect()
+	};
+
+	let mut module = match module {
+		Ok(res) => res,
+		Err(error) => {
+			let error = error_to_string(sourcemap.as_ref(), &error);
+			return Messages {
+				warns,
+				result: Err(error),
+			};
+		}
+	};
+
+	let module = with_extra_options(|extra_option| {
+		use swc_ecma_minifier::optimize;
+		use swc_ecma_transforms_base::{fixer::fixer, resolver};
+		use swc_ecma_visit::VisitMutWith;
+
 		module.visit_mut_with(&mut resolver(
 			extra_option.unresolved_mark,
 			extra_option.top_level_mark,
 			false,
 		));
 
-		let mut module = minifier_optimize(
+		let mut module = optimize(
 			Program::Module(module),
 			Default::default(),
+			dyn_comments,
 			None,
-			None,
-			&minify_option(&opt).map_err(|e| anyhow!("{e}"))?,
+			&minify_option(&opt),
 			&extra_option,
 		)
 		.expect_module();
 
 		module.visit_mut_with(&mut fixer(None));
+		module
+	});
 
-		let writter = JsWriter::new(sourcemap.clone(), "", output, None);
+	let mut out = Vec::new();
 
-		let mut emitter = CodegenEmitter {
-			cfg: codegen_config(opt.target),
-			cm: sourcemap,
-			comments: None,
-			wr: writter,
-		};
+	let emitted = codegen::Emitter {
+		cfg: codegen::Config {
+			target: opt.target.0,
+			ascii_only: false,
+			minify: true,
+			omit_last_semi: true,
+		},
+		comments: dyn_comments,
+		wr: omit_trailing_semi(JsWriter::new(
+			sourcemap.clone(),
+			"\n",
+			&mut out,
+			None,
+		)),
+		cm: sourcemap,
+	}
+	.emit_module(&module);
 
-		emitter.emit_module(&module)?;
+	Messages {
+		warns,
+		result: emitted.map(|_| Output(out)).map_err(|v| v.to_string()),
+	}
+}
 
+fn file_reader(path: impl AsRef<Path>) -> io::Result<io::BufReader<fs::File>> {
+	Ok(io::BufReader::new(fs::File::open(path)?))
+}
+
+fn argf(path: Option<impl AsRef<Path>>) -> io::Result<Vec<u8>> {
+	use std::io::Read;
+
+	let mut source = Vec::new();
+
+	match path {
+		Some(path) => file_reader(path)?.read_to_end(&mut source),
+		None => io::stdin().lock().read_to_end(&mut source),
+	}?;
+
+	Ok(source)
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+struct AlreadyHasBeen(String);
+
+impl fmt::Display for AlreadyHasBeen {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "The option `{}` can be set only once.", self.0)
+	}
+}
+
+impl error::Error for AlreadyHasBeen {}
+
+impl From<AlreadyHasBeen> for lexopt::Error {
+	#[inline]
+	fn from(value: AlreadyHasBeen) -> Self {
+		lexopt::Error::Custom(Box::new(value))
+	}
+}
+
+fn expect_empty<T>(val: &Option<T>, name: &str) -> Result<(), lexopt::Error> {
+	if val.is_none() {
 		Ok(())
-	})
+	} else {
+		Err(AlreadyHasBeen(name.into()).into())
+	}
+}
+
+fn parse_args() -> Result<(Option<OsString>, Option<OsString>), lexopt::Error> {
+	use lexopt::{Arg, Parser};
+	let mut option = None;
+	let mut input_path = None;
+	let mut parser = Parser::from_env();
+	while let Some(arg) = parser.next()? {
+		match arg {
+			Arg::Long("option") => {
+				expect_empty(&option, "option")?;
+				option = Some(parser.value()?);
+			}
+
+			Arg::Value(val) => {
+				expect_empty(&input_path, "FILE")?;
+				input_path = Some(val);
+			}
+
+			_ => return Err(arg.unexpected()),
+		}
+	}
+
+	Ok((option, input_path))
+}
+
+fn resolve_miniopt(arg: Option<OsString>) -> anyhow::Result<MiniOpt> {
+	if let Some(arg) = arg {
+		let inline = arg.to_str().and_then(|v| {
+			if v.trim_start().starts_with('{') {
+				Some(v)
+			} else {
+				None
+			}
+		});
+
+		if let Some(inline) = inline {
+			serde_json::from_str(inline)
+		} else {
+			serde_json::from_reader(&mut file_reader(arg)?)
+		}
+		.map_err(|v| v.into())
+	} else {
+		Ok(Default::default())
+	}
 }
 
 fn main() -> anyhow::Result<()> {
-	minify(
-		&mut io::stdin(),
-		// TODO: nice way to receive thiis
-		from_value(json!({
-			"global_def": {
-				"typeof TextDecoder": "\"function\""
-			},
-			"pure_func": []
-		}))?,
-		io::stdout(),
-	)
+	let (opt, source) = {
+		let (option, input_path) = parse_args()?;
+		(
+			resolve_miniopt(option)?,
+			String::from_utf8(argf(input_path)?)?,
+		)
+	};
+
+	let mut res = minify(source, opt);
+
+	for mut warn in res.warns.drain(0..) {
+		warn.push('\n');
+		io::Write::write_all(&mut io::stderr(), warn.as_bytes())?;
+	}
+
+	match res.result {
+		Err(err) => Err(anyhow::Error::msg(err)),
+		Ok(source) => io::Write::write_all(&mut io::stdout(), &source.0)
+			.map_err(|err| err.into()),
+	}
 }
