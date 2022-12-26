@@ -597,6 +597,11 @@ fn main() -> anyhow::Result<()> {
 		}
 	};
 
+	if source.trim().is_empty() {
+		io::stderr().write_all(HELP_MESSAGE)?;
+		return Err(anyhow::Error::msg("input is somehow empty."));
+	}
+
 	let mut res = minify(source, opt);
 
 	for mut warn in res.warns.drain(0..) {
