@@ -19,6 +19,11 @@ serde = '*'
 
 lexopt = '0.2.1'
 
+[dependencies.const-str]
+version = '0.5.3'
+default-features = false
+features = []
+
 [dependencies.swc_ecma_minifier]
 version = '0.160.28'
 default-features = false

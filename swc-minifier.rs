@@ -1,4 +1,6 @@
-use swc_common::{sync::Lrc, FileName, SourceMap, SourceMapper, Span};
+use swc_common::{
+	collections::AHashMap, sync::Lrc, FileName, SourceMap, SourceMapper, Span,
+};
 use swc_ecma_ast::{EsVersion, Expr};
 use swc_ecma_minifier::option::{ExtraOptions, MinifyOptions};
 use swc_ecma_parser as ecma;
@@ -6,9 +8,7 @@ use swc_ecma_parser as ecma;
 use serde::{de::Deserialize, Deserializer};
 use serde_derive::Deserialize;
 
-use std::{
-	collections::HashMap, error, ffi::OsString, fmt, fs, io, path::Path,
-};
+use std::{error, ffi::OsString, fmt, fs, io, marker::PhantomData, path::Path};
 
 const SANE_ECMA: ecma::Syntax = ecma::Syntax::Es(ecma::EsConfig {
 	jsx: false,
@@ -79,16 +79,25 @@ fn parse_expr(s: impl AsRef<str>) -> Result<Box<Expr>, String> {
 #[derive(Hash, PartialEq, Eq)]
 struct ExprBox(Box<Expr>);
 
+impl TryFrom<String> for ExprBox {
+	type Error = String;
+	fn try_from(value: String) -> Result<Self, Self::Error> {
+		parse_expr(value).map(ExprBox)
+	}
+}
+
 impl<'de> Deserialize<'de> for ExprBox {
 	fn deserialize<D>(deser: D) -> Result<Self, D::Error>
 	where
 		D: Deserializer<'de>,
 	{
-		let s: String = Deserialize::deserialize(deser)?;
-		match parse_expr(s) {
-			Ok(s) => Ok(ExprBox(s)),
-			Err(e) => Err(<D::Error as serde::de::Error>::custom(e)),
-		}
+		Deser::<String, _>::deser_try(deser)
+	}
+}
+
+impl From<ExprBox> for Box<Expr> {
+	fn from(value: ExprBox) -> Self {
+		value.0
 	}
 }
 
@@ -102,24 +111,125 @@ impl Default for TargetVersion {
 	}
 }
 
+impl From<TargetVersion> for EsVersion {
+	fn from(value: TargetVersion) -> Self {
+		value.0
+	}
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+	One(T),
+	Many(Vec<T>),
+}
+
+impl<T> From<OneOrMany<T>> for Vec<T> {
+	fn from(value: OneOrMany<T>) -> Self {
+		match value {
+			OneOrMany::One(x) => Vec::from([x]),
+			OneOrMany::Many(vec) => vec,
+		}
+	}
+}
+
+impl<T> IntoIterator for OneOrMany<T> {
+	type Item = T;
+	type IntoIter = <Vec<T> as IntoIterator>::IntoIter;
+
+	fn into_iter(self) -> Self::IntoIter {
+		let vec = Vec::from(self);
+		vec.into_iter()
+	}
+}
+
+impl<T> Default for OneOrMany<T> {
+	fn default() -> Self {
+		OneOrMany::Many(Vec::default())
+	}
+}
+
+struct Deser<I, O> {
+	input: PhantomData<I>,
+	output: PhantomData<O>,
+}
+
+impl<'de, O: From<I>, I: Deserialize<'de>> Deser<I, O> {
+	fn deser<D: Deserializer<'de>>(deser: D) -> Result<O, D::Error> {
+		let input: I = Deserialize::deserialize(deser)?;
+		Ok(O::from(input))
+	}
+}
+
+impl<
+		'de,
+		O: From<I>,
+		I,
+		WI: IntoIterator<Item = I> + Deserialize<'de>,
+		WO: IntoIterator<Item = O> + FromIterator<O>,
+	> Deser<WI, WO>
+{
+	fn deser_seq<D: Deserializer<'de>>(deser: D) -> Result<WO, D::Error> {
+		let input: WI = Deserialize::deserialize(deser)?;
+		Ok(WO::from_iter(input.into_iter().map(|i: I| O::from(i))))
+	}
+}
+
+impl<
+		'de,
+		O: From<I>,
+		I,
+		WI: IntoIterator<Item = (I, I)> + Deserialize<'de>,
+		WO: IntoIterator<Item = (O, O)> + FromIterator<(O, O)>,
+	> Deser<WI, WO>
+{
+	fn deser_map<D: Deserializer<'de>>(deser: D) -> Result<WO, D::Error> {
+		let input: WI = Deserialize::deserialize(deser)?;
+		Ok(WO::from_iter(
+			input
+				.into_iter()
+				.map(|(i, j): (I, I)| (O::from(i), O::from(j))),
+		))
+	}
+}
+
+impl<'de, E: ToString, O: TryFrom<I, Error = E>, I: Deserialize<'de>>
+	Deser<I, O>
+{
+	fn deser_try<D: Deserializer<'de>>(deser: D) -> Result<O, D::Error> {
+		let input: I = Deserialize::deserialize(deser)?;
+		O::try_from(input)
+			.map_err(|e| <D::Error as serde::de::Error>::custom(e.to_string()))
+	}
+}
+
 #[derive(Default, Deserialize)]
 struct MiniOpt {
 	#[serde(
 		alias = "global_def",
 		alias = "globals_def",
 		alias = "globals_defs",
+		deserialize_with = "Deser::<AHashMap<ExprBox, ExprBox>, _>::deser_map",
 		default
 	)]
-	global_defs: HashMap<ExprBox, ExprBox>,
+	global_defs: AHashMap<Box<Expr>, Box<Expr>>,
 
-	#[serde(alias = "pure_func", default)]
-	pure_funcs: Vec<ExprBox>,
+	#[serde(
+		alias = "pure_func",
+		deserialize_with = "Deser::<OneOrMany<ExprBox>, _>::deser_seq",
+		default
+	)]
+	pure_funcs: Vec<Box<Expr>>,
 
-	#[serde(default)]
-	target: TargetVersion,
+	#[serde(
+		alias = "targets",
+		deserialize_with = "Deser::<TargetVersion, _>::deser",
+		default = "EsVersion::latest"
+	)]
+	target: EsVersion,
 }
 
-fn minify_option(opt: &MiniOpt) -> MinifyOptions {
+fn minify_option(opt: MiniOpt) -> MinifyOptions {
 	use swc_ecma_minifier::option::{
 		CompressOptions, MangleOptions, ManglePropertiesOptions,
 		PureGetterOption, TopLevelOptions,
@@ -143,11 +253,7 @@ fn minify_option(opt: &MiniOpt) -> MinifyOptions {
 			ecma: EsVersion::latest(),
 			evaluate: true,
 			expr: true,
-			global_defs: opt
-				.global_defs
-				.iter()
-				.map(|(k, v)| (k.0.clone(), v.0.clone()))
-				.collect(),
+			global_defs: opt.global_defs,
 			hoist_fns: false,
 			hoist_props: true,
 			hoist_vars: false,
@@ -165,7 +271,7 @@ fn minify_option(opt: &MiniOpt) -> MinifyOptions {
 			passes: 0,
 			props: true,
 			pure_getters: PureGetterOption::Strict,
-			pure_funcs: opt.pure_funcs.iter().map(|v| v.0.clone()).collect(),
+			pure_funcs: opt.pure_funcs,
 			reduce_fns: true,
 			reduce_vars: true,
 			sequences: 200,
@@ -239,6 +345,8 @@ fn minify(source: String, opt: MiniOpt) -> Messages {
 	};
 	use swc_ecma_parser::{Parser, StringInput};
 
+	let target = opt.target;
+
 	let sourcemap = Lrc::<SourceMap>::default();
 
 	// TODO: leading userscript comments, pure comments
@@ -290,7 +398,7 @@ fn minify(source: String, opt: MiniOpt) -> Messages {
 			Default::default(),
 			dyn_comments,
 			None,
-			&minify_option(&opt),
+			&minify_option(opt),
 			&extra_option,
 		)
 		.expect_module();
@@ -303,7 +411,7 @@ fn minify(source: String, opt: MiniOpt) -> Messages {
 
 	let emitted = codegen::Emitter {
 		cfg: codegen::Config {
-			target: opt.target.0,
+			target,
 			ascii_only: false,
 			minify: true,
 			omit_last_semi: true,
@@ -369,14 +477,70 @@ fn expect_empty<T>(val: &Option<T>, name: &str) -> Result<(), lexopt::Error> {
 	}
 }
 
-fn parse_args() -> Result<(Option<OsString>, Option<OsString>), lexopt::Error> {
+const BIN_NAME: &str = env!("CARGO_BIN_NAME");
+const BIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const VERSION_INFO: &[u8] =
+	const_str::concat_bytes!(BIN_NAME, " v", BIN_VERSION);
+
+const HELP_MESSAGE: &[u8] = const_str::concat_bytes!(
+	"Usage:\n\t",
+	BIN_NAME,
+	r#" [options] [--] [file]
+
+OPTIONS
+	[file]       input file. uses STDIN if not given.
+
+	--help       you are reading this
+	--version    print version
+
+	--config=CONFIG, --option=CONFIG
+		JSON minify options, file path or inline.
+		anything starting with { considered as inline JSON.
+
+CONFIG
+	Must be valid JSON key-value object.
+	Recommend using other tools to convert to JSON.
+	Every config keys can be end with trailing `s` in each words.
+		(ex. "globals_def", "global_defs", "globals_defs"
+		are all the same thing, but should appear only one in the config.)
+
+	"global_def" object (default: {})
+		Key will be replaced to value.
+		Every key or value in this object will be treated as JS expressions,
+		so unlike Terser, `@` prefix will cause parsing error.
+
+		Wrap with quotes for string.
+
+		Example:
+			{ "global_def": { "typeof TextEncoder": "\"function\"" } }
+
+	"pure_func" array (default: [])
+		List of functions which can be removed if not used.
+
+	"target" string (default: "es2022")
+		Output ECMAScript version. Can be: es3, es5, es2015, es2016, ...
+"#,
+	b'\n'
+);
+
+enum SungsimdangArg {
+	Help,
+	Version,
+	Data((Option<OsString>, Option<OsString>)),
+}
+
+fn parse_args() -> Result<SungsimdangArg, lexopt::Error> {
 	use lexopt::{Arg, Parser};
+
 	let mut option = None;
 	let mut input_path = None;
 	let mut parser = Parser::from_env();
 	while let Some(arg) = parser.next()? {
 		match arg {
-			Arg::Long("option") => {
+			Arg::Long("help") => return Ok(SungsimdangArg::Help),
+			Arg::Long("version") => return Ok(SungsimdangArg::Version),
+			Arg::Long("option") | Arg::Long("config") => {
 				expect_empty(&option, "option")?;
 				option = Some(parser.value()?);
 			}
@@ -390,7 +554,7 @@ fn parse_args() -> Result<(Option<OsString>, Option<OsString>), lexopt::Error> {
 		}
 	}
 
-	Ok((option, input_path))
+	Ok(SungsimdangArg::Data((option, input_path)))
 }
 
 fn resolve_miniopt(arg: Option<OsString>) -> anyhow::Result<MiniOpt> {
@@ -415,24 +579,36 @@ fn resolve_miniopt(arg: Option<OsString>) -> anyhow::Result<MiniOpt> {
 }
 
 fn main() -> anyhow::Result<()> {
+	use std::io::Write;
 	let (opt, source) = {
-		let (option, input_path) = parse_args()?;
-		(
-			resolve_miniopt(option)?,
-			String::from_utf8(argf(input_path)?)?,
-		)
+		match parse_args()? {
+			SungsimdangArg::Help => {
+				io::stdout().write_all(HELP_MESSAGE)?;
+				return Ok(());
+			}
+			SungsimdangArg::Version => {
+				io::stdout().write_all(VERSION_INFO)?;
+				return Ok(());
+			}
+			SungsimdangArg::Data((option, input_path)) => (
+				resolve_miniopt(option)?,
+				String::from_utf8(argf(input_path)?)?,
+			),
+		}
 	};
 
 	let mut res = minify(source, opt);
 
 	for mut warn in res.warns.drain(0..) {
 		warn.push('\n');
-		io::Write::write_all(&mut io::stderr(), warn.as_bytes())?;
+		io::stderr().write_all(warn.as_bytes())?;
 	}
 
 	match res.result {
 		Err(err) => Err(anyhow::Error::msg(err)),
-		Ok(source) => io::Write::write_all(&mut io::stdout(), &source.0)
-			.map_err(|err| err.into()),
+		Ok(source) => {
+			io::stdout().write_all(&source.0)?;
+			Ok(())
+		}
 	}
 }
