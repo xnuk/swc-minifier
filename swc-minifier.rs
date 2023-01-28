@@ -300,7 +300,7 @@ fn minify_option(opt: MiniOpt) -> MinifyOptions {
 				undeclared: None,
 				regex: None,
 			}),
-			top_level: true,
+			top_level: Some(true),
 			keep_class_names: false,
 			keep_fn_names: false,
 			keep_private_props: false,
