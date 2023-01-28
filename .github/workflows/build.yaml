@@ -28,7 +28,7 @@ jobs:
         && chmod +x upx
         && sha256sum upx
         | grep 4943e5e4c5b9c00e78e88e3fecb50ed52a6dccf85714fe2c3bced7ebfb0dd285
-    - run: cargo build --release
+    - run: cargo build --release --locked
     - name: compressing
       run: >
         cp target/release/swc-minifier .
