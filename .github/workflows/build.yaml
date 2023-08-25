@@ -23,11 +23,11 @@ jobs:
       run: rustup install stable && rustup default stable
     - name: upx
       run: >
-        curl -L --get https://github.com/upx/upx/releases/download/v4.0.1/upx-4.0.1-amd64_linux.tar.xz
-        | tar -xJOf - upx-4.0.1-amd64_linux/upx > upx
+        curl -L --get https://github.com/upx/upx/releases/download/v4.1.0/upx-4.1.0-amd64_linux.tar.xz
+        | tar -xJOf - upx-4.1.0-amd64_linux/upx > upx
         && chmod +x upx
         && sha256sum upx
-        | grep 4943e5e4c5b9c00e78e88e3fecb50ed52a6dccf85714fe2c3bced7ebfb0dd285
+        | grep 76bc250b88595cdf92d9ea853c402d0345178a0d32a12cb2a4850d9bd079cd19
     - run: cargo build --release --locked
     - name: compressing
       run: >
