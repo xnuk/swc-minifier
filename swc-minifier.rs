@@ -2,7 +2,9 @@ use swc_common::{
 	collections::AHashMap, sync::Lrc, FileName, SourceMap, SourceMapper, Span,
 };
 use swc_ecma_ast::{EsVersion, Expr};
-use swc_ecma_minifier::option::{ExtraOptions, MinifyOptions};
+use swc_ecma_minifier::option::{
+	ExtraOptions, ManglePropertiesOptions, MinifyOptions,
+};
 use swc_ecma_parser as ecma;
 
 use serde::{de::Deserialize, Deserializer};
@@ -229,18 +231,20 @@ struct MiniOpt {
 		default = "EsVersion::latest"
 	)]
 	target: EsVersion,
+
+	#[serde(alias = "mangle_props", default)]
+	mangle_prop: Option<ManglePropertiesOptions>,
 }
 
 fn minify_option(opt: MiniOpt) -> MinifyOptions {
 	use swc_ecma_minifier::option::{
-		CompressOptions, MangleOptions, ManglePropertiesOptions,
-		PureGetterOption, TopLevelOptions,
+		CompressOptions, MangleOptions, PureGetterOption, TopLevelOptions,
 	};
 
 	MinifyOptions {
 		rename: true,
 		compress: Some(CompressOptions {
-			arguments: false,
+			arguments: true,
 			arrows: true,
 			bools: true,
 			bools_as_ints: false,
@@ -261,7 +265,7 @@ fn minify_option(opt: MiniOpt) -> MinifyOptions {
 			hoist_vars: false,
 			ie8: false,
 			if_return: true,
-			inline: 1,
+			inline: 3,
 			join_vars: true,
 			keep_classnames: false,
 			keep_fargs: false,
@@ -297,11 +301,7 @@ fn minify_option(opt: MiniOpt) -> MinifyOptions {
 			pristine_globals: true,
 		}),
 		mangle: Some(MangleOptions {
-			props: Some(ManglePropertiesOptions {
-				reserved: Vec::new(),
-				undeclared: None,
-				regex: None,
-			}),
+			props: opt.mangle_prop,
 			top_level: Some(true),
 			keep_class_names: false,
 			keep_fn_names: false,
@@ -523,6 +523,23 @@ CONFIG
 
 	"target" string (default: "es2022")
 		Output ECMAScript version. Can be: es3, es5, es2015, es2016, ...
+
+	"mangle_props" object (default: null)
+		Mangle properties option.
+		This is turned off by default by various reasons.
+		Test it, run it, and if brokes, you may want to turn off this.
+
+		Example:
+		{
+			// Don't use these names as properties.
+			"reserved": [ "idents", "that_should_not", "be_mangled" ],
+
+			// Mangle properties even if it's not declared.
+			"undeclared": false,
+
+			// Mangle properties only if it matches this Rust regex
+			"regex": "some rust regex"
+		}
 "#,
 	b'\n'
 );
