@@ -19,6 +19,8 @@ const SANE_ECMA: ecma::Syntax = ecma::Syntax::Es(ecma::EsConfig {
 	import_assertions: true,
 	allow_super_outside_method: false,
 	allow_return_outside_function: false,
+	auto_accessors: false,
+	using_decl: false,
 });
 
 trait SpanToString {
@@ -307,6 +309,7 @@ fn minify_option(opt: MiniOpt) -> MinifyOptions {
 			ie8: false,
 			safari10: false,
 			reserved: Vec::new(),
+			eval: false,
 		}),
 
 		wrap: false,
